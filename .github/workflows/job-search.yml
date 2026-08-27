@@ -2,14 +2,55 @@ name: Job Search
 
 on:
   schedule:
-    # Cada 4 horas: 1,5,9,13,17,21 UTC = 20:00,00:00,04:00,08:00,12:00,16:00 hora Colombia (UTC-5).
-    # En el minuto :07, NO en punto -- GitHub puede saltarse sin avisar los crons programados
-    # justo al inicio de la hora bajo alta carga (el momento de mayor congestión de la plataforma).
-    - cron: "7 1,5,9,13,17,21 * * *"
+    # Dispara CADA HORA (en :17, no en punto -- evita la congestión del inicio de la hora) en vez
+    # de cada 4h -- el disparo real sigue siendo cada ~4h (lo decide el job "gate" de abajo), pero
+    # tener 4 oportunidades de más por ciclo es lo que permite auto-recuperarse cuando GitHub se
+    # salta o cancela un tick (pasa de verdad: un tick de cron perdido sin cola ni aviso, o una
+    # falla real de la plataforma como la de githubstatus.com del 26-27/08). Antes, un tick
+    # perdido significaba quedarse sin esa corrida hasta la siguiente, sin que nadie se enterara.
+    - cron: "17 * * * *"
   workflow_dispatch: {}
 
+# Nunca dos corridas en paralelo -- si un tick atrasado y uno nuevo coinciden, la segunda espera
+# a que termine la primera en vez de pisarle los datos.
+concurrency:
+  group: job-search
+  cancel-in-progress: false
+
+permissions:
+  actions: read
+  contents: read
+
 jobs:
+  gate:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule'
+    outputs:
+      should_run: ${{ steps.check.outputs.should_run }}
+    steps:
+      - name: Verificar si ya hubo una corrida exitosa en las últimas 4h
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          last=$(gh api "repos/${{ github.repository }}/actions/workflows/job-search.yml/runs?status=success&per_page=5" \
+            --jq '[.workflow_runs[] | select(.id != ${{ github.run_id }})][0].created_at // empty')
+          if [ -z "$last" ]; then
+            echo "sin corridas exitosas previas -- corre."
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          elapsed_h=$(( ( $(date -u +%s) - $(date -u -d "$last" +%s) ) / 3600 ))
+          echo "última corrida exitosa hace ${elapsed_h}h"
+          if [ "$elapsed_h" -ge 4 ]; then
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_run=false" >> "$GITHUB_OUTPUT"
+          fi
+
   run:
+    needs: gate
+    if: always() && (github.event_name != 'schedule' || needs.gate.outputs.should_run == 'true')
     runs-on: ubuntu-latest
     # Repo público -> Actions es ilimitado/gratis. 45 min completos para este único usuario, sin
     # repartir con nadie más.

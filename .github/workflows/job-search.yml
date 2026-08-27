@@ -2,12 +2,17 @@ name: Job Search
 
 on:
   schedule:
-    # Dispara CADA HORA (en :17, no en punto -- evita la congestión del inicio de la hora) en vez
-    # de cada 4h -- el disparo real sigue siendo cada ~4h (lo decide el paso "gate" de abajo), pero
-    # tener 4 oportunidades de más por ciclo es lo que permite auto-recuperarse cuando GitHub se
-    # salta o cancela un tick.
+    # El schedule de GitHub no es confiable (confirmado en vivo: huecos de hasta 11+ horas, y un
+    # cron de prueba cada minuto no disparó ni una vez en 6+ min -- falla de la plataforma). Se
+    # deja como intento de más, pero el respaldo real es /api/cron/dispatch del dashboard,
+    # llamado por un pinger externo cada 20-30 min vía workflow_dispatch.
     - cron: "17 * * * *"
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Forzar corrida completa aunque haya corrido hace menos de 4h"
+        type: boolean
+        default: false
 
 permissions:
   actions: read
@@ -21,7 +26,11 @@ jobs:
     timeout-minutes: 45
     steps:
       - name: Verificar si ya hubo una corrida exitosa en las últimas 4h
-        if: github.event_name == 'schedule'
+        # Se salta SOLO si vino con force=true (un humano le dio "Run workflow" y marcó la
+        # casilla, o una corrida de prueba explícita) -- tanto el schedule como el
+        # workflow_dispatch normal (el que llama /api/cron/dispatch cada 20-30 min) respetan
+        # este chequeo, así llamarlo seguido nunca duplica una corrida real.
+        if: github.event.inputs.force != 'true'
         id: gate
         env:
           GH_TOKEN: ${{ github.token }}
@@ -42,23 +51,23 @@ jobs:
           fi
 
       - uses: actions/checkout@v4
-        if: github.event_name != 'schedule' || steps.gate.outputs.should_run == 'true'
+        if: github.event.inputs.force == 'true' || steps.gate.outputs.should_run == 'true'
 
       - uses: actions/setup-python@v5
-        if: github.event_name != 'schedule' || steps.gate.outputs.should_run == 'true'
+        if: github.event.inputs.force == 'true' || steps.gate.outputs.should_run == 'true'
         with:
           python-version: "3.11"
 
       - name: Instalar dependencias
-        if: github.event_name != 'schedule' || steps.gate.outputs.should_run == 'true'
+        if: github.event.inputs.force == 'true' || steps.gate.outputs.should_run == 'true'
         run: pip install -r requirements.txt
 
       - name: Instalar Chromium (para las fuentes que necesitan navegador)
-        if: github.event_name != 'schedule' || steps.gate.outputs.should_run == 'true'
+        if: github.event.inputs.force == 'true' || steps.gate.outputs.should_run == 'true'
         run: playwright install --with-deps chromium
 
       - name: Ejecutar búsqueda y postulación asistida
-        if: github.event_name != 'schedule' || steps.gate.outputs.should_run == 'true'
+        if: github.event.inputs.force == 'true' || steps.gate.outputs.should_run == 'true'
         env:
           # No es secreto -- es la URL pública del dashboard, no un dato sensible.
           DASHBOARD_API_BASE: https://job-hunter-ai-theta.vercel.app

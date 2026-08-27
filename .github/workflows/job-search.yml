@@ -2,8 +2,10 @@ name: Job Search
 
 on:
   schedule:
-    # Cada 4 horas: 1,5,9,13,17,21 UTC = 20:00,00:00,04:00,08:00,12:00,16:00 hora Colombia (UTC-5)
-    - cron: "0 1,5,9,13,17,21 * * *"
+    # Cada 4 horas: 1,5,9,13,17,21 UTC = 20:00,00:00,04:00,08:00,12:00,16:00 hora Colombia (UTC-5).
+    # En el minuto :07, NO en punto -- GitHub puede saltarse sin avisar los crons programados
+    # justo al inicio de la hora bajo alta carga (el momento de mayor congestión de la plataforma).
+    - cron: "7 1,5,9,13,17,21 * * *"
   workflow_dispatch: {}
 
 jobs:

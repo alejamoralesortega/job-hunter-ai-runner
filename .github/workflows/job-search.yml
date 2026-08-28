@@ -14,6 +14,16 @@ on:
         type: boolean
         default: false
 
+# Nunca dos corridas en paralelo -- confirmado en producción: sin esto, varios disparos
+# seguidos (ej. varias llamadas a /api/cron/dispatch?force=true en poco tiempo, o el pinger
+# externo coincidiendo con una corrida ya en curso) hacen que el mismo repo termine con varias
+# corridas reales simultáneas, cada una repitiendo el mismo trabajo (scraping, scoring con
+# Gemini) sin saber de las demás. cancel-in-progress:false -- la nueva espera en cola en vez
+# de interrumpir una corrida real ya empezada.
+concurrency:
+  group: job-search
+  cancel-in-progress: false
+
 permissions:
   actions: read
   contents: read

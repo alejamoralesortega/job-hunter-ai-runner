@@ -35,15 +35,21 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          last=$(gh api "repos/${{ github.repository }}/actions/workflows/job-search.yml/runs?status=success&per_page=5" \
-            --jq '[.workflow_runs[] | select(.id != ${{ github.run_id }})][0].created_at // empty')
+          # OJO: un ciclo que el propio gate saltó también termina en conclusion "success" --
+          # ningún paso falló, solo se saltaron. Filtrar solo por status=success sin más se
+          # toma a sí mismo como referencia cada vez (queda en 0h para siempre, nunca vuelve a
+          # correr de verdad -- pasó en producción). Se filtra por duración: un gate-skip tarda
+          # 1-2s, un ciclo real tarda varios minutos -- solo cuenta como "corrida real" una que
+          # haya durado más de 60s.
+          last=$(gh api "repos/${{ github.repository }}/actions/workflows/job-search.yml/runs?status=success&per_page=30" \
+            --jq '[.workflow_runs[] | select(.id != ${{ github.run_id }}) | select((.updated_at | fromdateiso8601) - (.run_started_at | fromdateiso8601) > 60)][0].created_at // empty')
           if [ -z "$last" ]; then
-            echo "sin corridas exitosas previas -- corre."
+            echo "sin corridas reales previas en las últimas 30 -- corre."
             echo "should_run=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           elapsed_h=$(( ( $(date -u +%s) - $(date -u -d "$last" +%s) ) / 3600 ))
-          echo "última corrida exitosa hace ${elapsed_h}h"
+          echo "última corrida REAL exitosa hace ${elapsed_h}h"
           if [ "$elapsed_h" -ge 4 ]; then
             echo "should_run=true" >> "$GITHUB_OUTPUT"
           else

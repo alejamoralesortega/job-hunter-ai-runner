@@ -26,7 +26,7 @@ from auto_apply import (
 from fetch_jobs import fetch_jobs_for_platforms
 from generate_cv import generate_tailored_cv
 from remote_sync import get_context, report_job
-from score_match import score_job
+from score_match import es_ubicacion_compatible, score_job
 
 load_dotenv()
 
@@ -76,6 +76,8 @@ def run():
     existing_ids = set(context.get("existingIds") or [])
     excluir_keywords = context.get("excluirTituloKeywords") or []
     score_threshold = context.get("scoreThreshold", 70)
+    modalidades = context.get("modalidades") or ["Remoto", "Híbrido", "Presencial"]
+    ciudad = context.get("ciudad")
     auto_apply_config = {"auto_apply_answers": context.get("autoApplyAnswers") or {}}
 
     jobs, fuentes_caidas = fetch_jobs_for_platforms(cargos, list(credenciales.keys()))
@@ -88,6 +90,7 @@ def run():
         "no_auto_aplicables": 0,
         "descartadas": 0,
         "no_elegibles": 0,
+        "fuera_de_ciudad": 0,
         "ya_procesadas": 0,
         "errores": 0,
         "sin_tiempo": 0,
@@ -110,10 +113,15 @@ def run():
             print(f"  no elegible: {job['titulo']} @ {job['empresa']} (ver excluir_titulo_keywords)")
             continue
 
+        if not es_ubicacion_compatible(job, ciudad):
+            stats["fuera_de_ciudad"] += 1
+            print(f"  otra ciudad, no remota: {job['titulo']} @ {job['empresa']} (se descarta sin gastar Gemini)")
+            continue
+
         # Un fallo con UNA oferta (Gemini caído, Playwright roto, la API del dashboard sin
         # responder, etc.) no debe tumbar el resto del ciclo.
         try:
-            score_result = score_job(job, gemini_key, cv_text=cv_text)
+            score_result = score_job(job, gemini_key, cv_text=cv_text, modalidades=modalidades, ciudad=ciudad)
             time.sleep(GEMINI_SLEEP_SECONDS)
 
             if score_result["score"] < score_threshold:
@@ -159,6 +167,7 @@ def run():
         f"\n[main] Resumen: {stats['auto_aplicadas']} auto-aplicadas | "
         f"{stats['no_auto_aplicables']} no auto-aplicables | "
         f"{stats['descartadas']} descartadas por score bajo | {stats['no_elegibles']} no elegibles | "
+        f"{stats['fuera_de_ciudad']} de otra ciudad (no remotas) | "
         f"{stats['ya_procesadas']} ya procesadas | {stats['errores']} con error inesperado | "
         f"{stats['sin_tiempo']} sin tiempo (quedan para el próximo ciclo)"
     )

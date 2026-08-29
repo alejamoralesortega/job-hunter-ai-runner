@@ -4,6 +4,7 @@ import json
 import os
 import re
 import time
+import unicodedata
 
 import requests
 
@@ -66,11 +67,88 @@ def _extract_json(text):
     return json.loads(match.group(0))
 
 
-def score_job(job, api_key, cv_text=None):
+_MODALIDADES_VALIDAS = {"Remoto", "Híbrido", "Presencial"}
+
+
+def _modalidad_prompt(modalidades):
+    """Sección extra del prompt para respetar la modalidad de trabajo que el candidato eligió en
+    Ajustes. Si eligió las 3 (o no configuró nada), no cambia nada del comportamiento de siempre
+    -- solo cuando excluyó alguna modalidad vale la pena penalizar por eso."""
+    if not modalidades:
+        return ""
+    elegidas = sorted({m for m in modalidades if m in _MODALIDADES_VALIDAS})
+    if not elegidas or len(elegidas) == len(_MODALIDADES_VALIDAS):
+        return ""
+    return f"""
+El candidato SOLO quiere considerar ofertas con esta modalidad de trabajo: {", ".join(elegidas)}.
+- Si la oferta es claramente de una modalidad que el candidato NO eligió (ej. es presencial y el
+  candidato no marcó "Presencial"), el score debe bajar considerablemente (máximo ~20 puntos),
+  aunque el match técnico sea excelente.
+- Si la modalidad de la oferta coincide con alguna de las elegidas, no la penalices por esto.
+- Si la descripción no aclara la modalidad, no penalices por este punto -- dale el beneficio de
+  la duda.
+"""
+
+
+# Capitales de departamento de Colombia -- mismo listado que CIUDADES_COLOMBIA en
+# dashboard/src/lib/types.ts (el desplegable de Ajustes), duplicado acá porque un lado es
+# TypeScript y el otro Python -- no hay forma de compartir el array literal entre los dos.
+CIUDADES_COLOMBIA = [
+    "Bogotá", "Medellín", "Cali", "Barranquilla", "Cartagena", "Cúcuta", "Bucaramanga",
+    "Ibagué", "Pereira", "Santa Marta", "Villavicencio", "Manizales", "Neiva", "Pasto",
+    "Armenia", "Valledupar", "Montería", "Sincelejo", "Popayán", "Tunja", "Florencia",
+    "Riohacha", "Yopal", "Quibdó", "Mocoa", "San Andrés", "Leticia", "Arauca", "Inírida",
+    "Mitú", "Puerto Carreño",
+]
+
+_REMOTO_KEYWORDS = [
+    "remoto", "remote", "home office", "trabajo desde casa", "100% virtual", "teletrabajo",
+]
+
+
+def _normalizar(text):
+    text = (text or "").lower()
+    return "".join(c for c in unicodedata.normalize("NFD", text) if unicodedata.category(c) != "Mn")
+
+
+def es_ubicacion_compatible(job, ciudad):
+    """Filtra ANTES de gastar una llamada a Gemini: si la oferta menciona una ciudad de Colombia
+    DISTINTA a la del candidato, y no hay ninguna señal de que sea remota (ni en la ubicación, ni
+    en el título, ni en la descripción), se descarta sin evaluar -- confirmado con un caso real
+    en producción: una oferta presencial en Cali para un candidato en Bogotá, sin ninguna palabra
+    "remoto" en ningún campo.
+
+    Sin `ciudad` configurada, no filtra nada (comportamiento de siempre, todo pasa a Gemini). Si
+    la oferta no menciona NINGUNA ciudad conocida, tampoco filtra -- mejor dejar que Gemini decida
+    con el resto del contexto (como hace hoy) que descartar a ciegas por texto ambiguo.
+    """
+    if not ciudad:
+        return True
+
+    texto = _normalizar(f"{job.get('ubicacion', '')} {job.get('titulo', '')} {job.get('descripcion', '')}")
+
+    if any(_normalizar(kw) in texto for kw in _REMOTO_KEYWORDS):
+        return True
+
+    ciudad_norm = _normalizar(ciudad)
+    if ciudad_norm in texto:
+        return True
+
+    otras_ciudades = [c for c in CIUDADES_COLOMBIA if _normalizar(c) != ciudad_norm]
+    menciona_otra_ciudad = any(_normalizar(c) in texto for c in otras_ciudades)
+    return not menciona_otra_ciudad
+
+
+def score_job(job, api_key, cv_text=None, modalidades=None, ciudad=None):
     """Devuelve dict {"score": int 0-100, "justificacion": str} para una oferta. Si no se pasa
     `cv_text` (modo multi-usuario, el CV de cada perfil), usa el CV fijo de data/base_cv.md
-    (modo single-user de siempre)."""
+    (modo single-user de siempre). `modalidades` es la lista de modalidades de trabajo que el
+    candidato eligió en Ajustes (Remoto/Híbrido/Presencial) -- None o las 3 juntas equivale a
+    "sin preferencia", el comportamiento de siempre. `ciudad` es la ciudad configurada en
+    Ajustes -- si no se pasa, se asume Bogotá (el valor que estuvo hardcodeado para todos los
+    usuarios hasta que se agregó el campo)."""
     cv = cv_text or load_base_cv()
+    ciudad_candidato = ciudad or "Bogotá"
     prompt = f"""Eres un reclutador técnico experto. Compara el siguiente CV con la oferta de
 empleo y responde SOLO con un JSON válido (sin texto adicional, sin markdown) con este formato:
 {{"score": <entero 0-100>, "justificacion": "<máximo 2 frases explicando el match>"}}
@@ -79,10 +157,10 @@ El score debe reflejar qué tan buen candidato es esta persona para este puesto 
 considerando stack técnico, seniority y responsabilidades.
 
 Además del match técnico, aplica esta prioridad geográfica/idioma como un factor que sube o baja
-el score (el candidato vive en Bogotá, Colombia):
+el score (el candidato vive en {ciudad_candidato}, Colombia):
 - PRIORIDAD ALTA: el puesto es remoto para candidatos en Colombia, remoto para Latinoamérica
-  (explícitamente incluye Colombia o LatAm), o es híbrido/presencial en Bogotá. Estos deben recibir
-  el score más alto que el match técnico permita.
+  (explícitamente incluye Colombia o LatAm), o es híbrido/presencial en {ciudad_candidato}. Estos
+  deben recibir el score más alto que el match técnico permita.
 - PRIORIDAD MEDIA: la oferta no aclara restricción geográfica (remoto "worldwide"/global sin
   exclusiones), o el equipo de trabajo es en español.
 - PRIORIDAD BAJA: el puesto es remoto solo para EE.UU., Canadá, Europa u otra región específica
@@ -94,7 +172,7 @@ el score (el candidato vive en Bogotá, Colombia):
   stack idéntico).
 Si la descripción no menciona nada sobre ubicación/restricciones de contratación, asume
 PRIORIDAD MEDIA.
-
+{_modalidad_prompt(modalidades)}
 --- CV ---
 {cv}
 

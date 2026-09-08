@@ -6,6 +6,8 @@ páginas no dan otra opción). Devuelven None si algo falla o la página cambió
 igual que las fuentes de fetch_jobs.py, para poder avisar por Telegram."""
 
 import time
+import unicodedata
+from urllib.parse import quote
 
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
@@ -14,6 +16,11 @@ USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/120.0 Safari/537.36 job-hunter-ai"
 )
+
+
+def _normalizar(text):
+    """minúsculas y sin tildes, para comparar palabras clave sin depender de acentos."""
+    return "".join(c for c in unicodedata.normalize("NFD", text.lower()) if unicodedata.category(c) != "Mn")
 
 
 def _scrape_with_retry(scrape_fn, source, context, retries=2, delay_seconds=8):
@@ -225,42 +232,77 @@ def fetch_computrabajo(keyword, limit=20):
     return normalized
 
 
-def fetch_trabajoscom(keyword, limit=20):
-    """Busca `keyword` en Trabajos.com Colombia (IDPAIS=40) vía su propio buscador. robots.txt
-    permite bots genéricos (solo bloquea Baidu/Yandex por completo), y sus condiciones de uso no
-    prohíben acceso automatizado."""
-    query = keyword.replace(" ", "+")
+_trabajoscom_cache = None
+
+
+def _fetch_trabajoscom_listado_general():
+    """Trae el listado general de Trabajos.com Colombia (IDPAIS=40) SIN filtro de palabra clave.
+
+    Su propio buscador (parámetro `CADENA`) está roto del lado de ellos -- devuelve "no hay
+    ninguna oferta" para cualquier término, incluso genéricos como "desarrollador", confirmado
+    replicando su propio formulario en vivo. El sitio sí tiene ofertas reales (decenas por
+    página) cuando se navega sin ese filtro, así que se trae el listado general una sola vez por
+    corrida (se cachea acá) y cada llamada a `fetch_trabajoscom` filtra por palabra clave sobre
+    ese universo compartido, en vez de confiar en su buscador."""
+    global _trabajoscom_cache
+    if _trabajoscom_cache is not None:
+        return _trabajoscom_cache
 
     def _do():
         with sync_playwright() as p:
             browser = p.chromium.launch()
             page = browser.new_page(user_agent=USER_AGENT)
-            page.goto(
-                f"https://colombia.trabajos.com/bolsa-empleo/?CADENA={query}&IDPAIS=40&SUBMIT=Buscar+empleo",
-                timeout=30000,
-                wait_until="domcontentloaded",
-            )
-            page.wait_for_timeout(1500)
-            items = page.eval_on_selector_all(
-                "div.card.oferta",
-                """
-                els => els.map(el => ({
-                    url: el.querySelector('a.oferta')?.href || '',
-                    title: el.querySelector('a.oferta')?.innerText?.trim() || '',
-                    company: el.querySelector('a.empresa span')?.innerText?.trim() || '',
-                    location: el.querySelector('.info-oferta .location')?.innerText?.replace(/\\s+/g, ' ').trim() || '',
-                }))
-                """,
-            )
+            items = []
+            for desde in (None, 41, 81):
+                sufijo = f"&DESDE={desde}" if desde else ""
+                page.goto(
+                    f"https://colombia.trabajos.com/bolsa-empleo/?CADENA=&IDPAIS=40&SUBMIT=Buscar+empleo{sufijo}",
+                    timeout=30000,
+                    wait_until="domcontentloaded",
+                )
+                page.wait_for_timeout(1200)
+                pagina_items = page.eval_on_selector_all(
+                    "div.card.oferta",
+                    """
+                    els => els.map(el => ({
+                        url: el.querySelector('a.oferta')?.href || '',
+                        title: el.querySelector('a.oferta')?.innerText?.trim() || '',
+                        company: el.querySelector('a.empresa span')?.innerText?.trim() || '',
+                        location: el.querySelector('.info-oferta .location')?.innerText?.replace(/\\s+/g, ' ').trim() || '',
+                    }))
+                    """,
+                )
+                if not pagina_items:
+                    break
+                items.extend(pagina_items)
             browser.close()
             return items
 
-    items = _scrape_with_retry(_do, "trabajoscom", f"buscando '{keyword}'")
+    items = _scrape_with_retry(_do, "trabajoscom", "trayendo el listado general (su buscador por CADENA está roto)")
     if items is None:
+        # No se cachea el fallo -- que el próximo cargo reintente desde cero, igual que antes.
         return None
+    _trabajoscom_cache = items
+    return _trabajoscom_cache
+
+
+def fetch_trabajoscom(keyword, limit=20):
+    """Busca `keyword` en Trabajos.com Colombia. Su propio buscador (parámetro `CADENA`) está
+    roto -- devuelve 0 resultados para cualquier término aunque el sitio sí tenga ofertas activas,
+    así que se filtra por palabra clave acá, sobre el listado general sin filtrar
+    (`_fetch_trabajoscom_listado_general`, cacheado una sola vez por corrida)."""
+    todas = _fetch_trabajoscom_listado_general()
+    if todas is None:
+        return None
+    if not todas:
+        print(f"[trabajoscom] listado general vacío, no se puede buscar '{keyword}'")
+        return []
+
+    palabra = _normalizar(keyword)
+    items = [it for it in todas if palabra in _normalizar(it["title"])]
 
     if not items:
-        print(f"[trabajoscom] 0 ofertas para '{keyword}'")
+        print(f"[trabajoscom] 0 ofertas para '{keyword}' (de {len(todas)} en el listado general)")
         return []
 
     seen = set()
@@ -291,37 +333,50 @@ def fetch_trabajoscom(keyword, limit=20):
 def fetch_manpowergroup(keyword, limit=20):
     """Busca `keyword` en el portal de carreras de ManpowerGroup Colombia (Avature). robots.txt
     permite explícitamente el path /careers (con excepciones a un Disallow: / general), y no
-    exige CAPTCHA en ningún paso del login/postulación."""
+    exige CAPTCHA en ningún paso del login/postulación.
+
+    Navega directo a la URL de resultados (en vez de llenar el input y hacer clic) porque el
+    listado pagina en tandas fijas de 6 (confirmado en vivo: `analista` solista tenía 164
+    resultados en el sitio, pero la búsqueda vía formulario solo deja ver los primeros 6, sin
+    ningún link de "siguiente página" seguido por el scraper) -- eso, no el volumen real de
+    ofertas de ManpowerGroup, era la razón de que tan pocas terminaran auto-aplicadas. La URL
+    soporta un `jobOffset` que sí trae las siguientes tandas de 6."""
+    query = quote(keyword)
 
     def _do():
         with sync_playwright() as p:
             browser = p.chromium.launch()
             page = browser.new_page(user_agent=USER_AGENT)
-            page.goto(
-                "https://manpowergroupco.avature.net/es_CO/careers/SearchJobs",
-                timeout=30000,
-                wait_until="domcontentloaded",
-            )
-            page.wait_for_selector("input[type=text]", timeout=15000)
-            page.fill("input[type=text]", keyword)
-            page.locator("button:has-text('BUSCAR'), input[type=submit]").first.click(timeout=10000)
-            page.wait_for_timeout(2000)
-            items = page.eval_on_selector_all(
-                "article.article--result",
-                """
-                els => els.map(el => {
-                    const a = el.querySelector('.article__header__text__title a');
-                    const spans = [...el.querySelectorAll('.article__header__text__subtitle span')]
-                        .map(s => s.innerText.trim());
-                    const location = spans.find(t => !t.startsWith('Publicado') && !t.startsWith('ID')) || '';
-                    return {
-                        url: a?.href || '',
-                        title: a?.innerText?.trim() || '',
-                        location: location,
-                    };
-                })
-                """,
-            )
+            items = []
+            for offset in range(0, 30, 6):  # hasta 5 tandas (30 ofertas) por cargo
+                page.goto(
+                    f"https://manpowergroupco.avature.net/es_CO/careers/SearchJobs/{query}"
+                    f"?listFilterMode=1&jobRecordsPerPage=6&jobOffset={offset}",
+                    timeout=30000,
+                    wait_until="domcontentloaded",
+                )
+                page.wait_for_timeout(1200)
+                tanda = page.eval_on_selector_all(
+                    "article.article--result",
+                    """
+                    els => els.map(el => {
+                        const a = el.querySelector('.article__header__text__title a');
+                        const spans = [...el.querySelectorAll('.article__header__text__subtitle span')]
+                            .map(s => s.innerText.trim());
+                        const location = spans.find(t => !t.startsWith('Publicado') && !t.startsWith('ID')) || '';
+                        return {
+                            url: a?.href || '',
+                            title: a?.innerText?.trim() || '',
+                            location: location,
+                        };
+                    })
+                    """,
+                )
+                if not tanda:
+                    break
+                items.extend(tanda)
+                if len(tanda) < 6:
+                    break  # última tanda (no llena) -- no hay más páginas
             browser.close()
             return items
 

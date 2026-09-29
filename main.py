@@ -4,8 +4,8 @@ gratis en repos públicos, 45 min completos cada 4h, sin competir por tiempo con
 A diferencia del cron central (repo privado), este runner nunca recibe la llave maestra de
 Supabase ni el token del bot de Telegram -- todo pasa por remote_sync.py, autenticado con
 DASHBOARD_API_TOKEN (secreto propio de este repo, scoped solo a los datos de este usuario en el
-dashboard). Trae su propia GEMINI_API_KEY (gratis, Google AI Studio) para no depender del cupo
-de nadie más.
+dashboard). Trae su propia LLM_API_KEY (Gemini gratis por defecto, Google AI Studio, o cualquier
+otro proveedor que el usuario haya elegido en Ajustes) para no depender del cupo de nadie más.
 """
 
 import os
@@ -26,7 +26,7 @@ from auto_apply import (
 from fetch_jobs import fetch_jobs_for_platforms
 from generate_cv import generate_tailored_cv
 from remote_sync import get_context, report_job
-from score_match import es_ubicacion_compatible, score_job
+from score_match import es_ubicacion_compatible, resolve_llm_config, score_job
 
 load_dotenv()
 
@@ -58,7 +58,14 @@ def _es_elegible(titulo, excluir_keywords):
 def run():
     api_base = os.environ["DASHBOARD_API_BASE"].rstrip("/")
     api_token = os.environ["DASHBOARD_API_TOKEN"]
-    gemini_key = os.environ["GEMINI_API_KEY"]
+    # LLM_API_KEY es el nombre nuevo (cualquier proveedor); GEMINI_API_KEY queda como respaldo
+    # mientras se termina de migrar el secret en cada repo -- ver plan de proveedor configurable.
+    llm_key = os.environ.get("LLM_API_KEY") or os.environ["GEMINI_API_KEY"]
+    llm_base_url, llm_model = resolve_llm_config(
+        os.environ.get("LLM_PROVIDER", "gemini"),
+        os.environ.get("LLM_BASE_URL"),
+        os.environ.get("LLM_MODEL"),
+    )
 
     context = get_context(api_base, api_token)
 
@@ -121,7 +128,10 @@ def run():
         # Un fallo con UNA oferta (Gemini caído, Playwright roto, la API del dashboard sin
         # responder, etc.) no debe tumbar el resto del ciclo.
         try:
-            score_result = score_job(job, gemini_key, cv_text=cv_text, modalidades=modalidades, ciudad=ciudad)
+            score_result = score_job(
+                job, llm_key, cv_text=cv_text, modalidades=modalidades, ciudad=ciudad,
+                base_url=llm_base_url, model=llm_model,
+            )
             time.sleep(GEMINI_SLEEP_SECONDS)
 
             if score_result["score"] < score_threshold:
@@ -131,7 +141,7 @@ def run():
 
             cv_path = None
             try:
-                cv_path = generate_tailored_cv(job, gemini_key, cv_text=cv_text)
+                cv_path = generate_tailored_cv(job, llm_key, cv_text=cv_text, base_url=llm_base_url, model=llm_model)
                 time.sleep(GEMINI_SLEEP_SECONDS)
             except Exception as e:
                 print(f"[main] error generando CV adaptado para '{job['titulo']}': {e}")

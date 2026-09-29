@@ -62,7 +62,10 @@ def run():
     # mientras se termina de migrar el secret en cada repo -- ver plan de proveedor configurable.
     llm_key = os.environ.get("LLM_API_KEY") or os.environ["GEMINI_API_KEY"]
     llm_base_url, llm_model = resolve_llm_config(
-        os.environ.get("LLM_PROVIDER", "gemini"),
+        # OJO: usar el default de .get() NO alcanza -- un secret de GitHub Actions sin
+        # configurar resuelve a "" (string vacío), no a la variable inexistente, así que .get()
+        # con default nunca se activaría. "or" sí trata "" como falsy y cae al default.
+        os.environ.get("LLM_PROVIDER") or "gemini",
         os.environ.get("LLM_BASE_URL"),
         os.environ.get("LLM_MODEL"),
     )

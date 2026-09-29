@@ -1,4 +1,6 @@
-"""Puntúa el match entre una oferta de empleo y el CV base usando Gemini (free tier)."""
+"""Puntúa el match entre una oferta de empleo y el CV base usando un modelo de IA -- Gemini por
+defecto (free tier), pero cualquier proveedor compatible con el formato de Chat Completions de
+OpenAI sirve (OpenAI, Groq, Mistral, DeepSeek, OpenRouter, Together, un servidor local, etc.)."""
 
 import json
 import os
@@ -9,10 +11,37 @@ import unicodedata
 import requests
 
 BASE_CV_PATH = os.path.join(os.path.dirname(__file__), "data", "base_cv.md")
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-flash-lite-latest")
-GEMINI_URL = (
-    f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
-)
+
+# Cada proveedor conocido resuelve a un base_url + modelo por defecto -- "custom" no tiene entrada
+# acá porque el usuario carga los suyos propios en Ajustes. Gemini habla acá vía SU PROPIO endpoint
+# de compatibilidad con OpenAI (https://ai.google.dev/gemini-api/docs/openai), no el nativo
+# "generateContent" -- mismos ids de modelo, pero auth Bearer y formato de Chat Completions, así
+# un solo cliente HTTP (_call_llm) sirve para todos los proveedores sin distinción.
+PROVIDER_PRESETS = {
+    "gemini": {
+        "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
+        "model": os.environ.get("GEMINI_MODEL", "gemini-flash-lite-latest"),
+    },
+    "openai": {
+        "base_url": "https://api.openai.com/v1",
+        "model": os.environ.get("OPENAI_MODEL", "gpt-4o-mini"),
+    },
+}
+
+
+def resolve_llm_config(provider, base_url=None, model=None):
+    """Resuelve (base_url, model) para `provider`. Para un preset conocido (gemini/openai), usa
+    sus valores salvo que se pase un override explícito. Para "custom" (o cualquier proveedor no
+    reconocido), exige que base_url/model vengan cargados -- no hay forma de adivinarlos."""
+    preset = PROVIDER_PRESETS.get(provider, {})
+    resolved_base_url = base_url or preset.get("base_url")
+    resolved_model = model or preset.get("model")
+    if not resolved_base_url or not resolved_model:
+        raise ValueError(
+            f"Proveedor '{provider}' sin base_url/modelo configurado -- cárgalos en Ajustes."
+        )
+    return resolved_base_url.rstrip("/"), resolved_model
+
 
 _base_cv_cache = None
 
@@ -28,42 +57,43 @@ def load_base_cv():
 _RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 
 
-def _call_gemini(prompt, api_key, max_retries=3, backoff_seconds=20):
-    """Llama a Gemini. Si el free tier responde 429 (rate limit), un 5xx transitorio (503
-    "Service Unavailable" es común y pasó en producción -- Gemini con carga alta, nada que ver
-    con la oferta) o hay un timeout/error de red, espera con backoff y reintenta en vez de darle
-    un score 0 injusto a una oferta que ni siquiera se llegó a evaluar."""
+def _call_llm(prompt, api_key, base_url, model, max_retries=3, backoff_seconds=20):
+    """Llama a un modelo de IA vía el formato de Chat Completions (OpenAI-compatible). Si el
+    proveedor responde 429 (rate limit), un 5xx transitorio (503 "Service Unavailable" es común y
+    pasó en producción con Gemini bajo carga alta, nada que ver con la oferta) o hay un
+    timeout/error de red, espera con backoff y reintenta en vez de darle un score 0 injusto a una
+    oferta que ni siquiera se llegó a evaluar."""
     delay = backoff_seconds
     for attempt in range(max_retries + 1):
         try:
             resp = requests.post(
-                GEMINI_URL,
-                params={"key": api_key},
-                json={"contents": [{"parts": [{"text": prompt}]}]},
+                f"{base_url}/chat/completions",
+                headers={"Authorization": f"Bearer {api_key}"},
+                json={"model": model, "messages": [{"role": "user", "content": prompt}]},
                 timeout=60,
             )
         except requests.RequestException as e:
             if attempt < max_retries:
-                print(f"[gemini] error de red ({e}), reintentando en {delay}s (intento {attempt + 1}/{max_retries})...")
+                print(f"[llm] error de red ({e}), reintentando en {delay}s (intento {attempt + 1}/{max_retries})...")
                 time.sleep(delay)
                 delay *= 2
                 continue
             raise
         if resp.status_code in _RETRYABLE_STATUS_CODES and attempt < max_retries:
-            print(f"[gemini] {resp.status_code}, reintentando en {delay}s (intento {attempt + 1}/{max_retries})...")
+            print(f"[llm] {resp.status_code}, reintentando en {delay}s (intento {attempt + 1}/{max_retries})...")
             time.sleep(delay)
             delay *= 2
             continue
         resp.raise_for_status()
         data = resp.json()
-        return data["candidates"][0]["content"]["parts"][0]["text"]
+        return data["choices"][0]["message"]["content"]
 
 
 def _extract_json(text):
-    """Gemini a veces envuelve el JSON en ```json ... ```; lo limpiamos."""
+    """El modelo a veces envuelve el JSON en ```json ... ```; lo limpiamos."""
     match = re.search(r"\{.*\}", text, re.DOTALL)
     if not match:
-        raise ValueError(f"No se encontró JSON en la respuesta de Gemini: {text[:200]}")
+        raise ValueError(f"No se encontró JSON en la respuesta del modelo: {text[:200]}")
     return json.loads(match.group(0))
 
 
@@ -139,14 +169,15 @@ def es_ubicacion_compatible(job, ciudad):
     return not menciona_otra_ciudad
 
 
-def score_job(job, api_key, cv_text=None, modalidades=None, ciudad=None):
+def score_job(job, api_key, cv_text=None, modalidades=None, ciudad=None, base_url=None, model=None):
     """Devuelve dict {"score": int 0-100, "justificacion": str} para una oferta. Si no se pasa
     `cv_text` (modo multi-usuario, el CV de cada perfil), usa el CV fijo de data/base_cv.md
     (modo single-user de siempre). `modalidades` es la lista de modalidades de trabajo que el
     candidato eligió en Ajustes (Remoto/Híbrido/Presencial) -- None o las 3 juntas equivale a
     "sin preferencia", el comportamiento de siempre. `ciudad` es la ciudad configurada en
     Ajustes -- si no se pasa, se asume Bogotá (el valor que estuvo hardcodeado para todos los
-    usuarios hasta que se agregó el campo)."""
+    usuarios hasta que se agregó el campo). `base_url`/`model` ya resueltos (ver
+    `resolve_llm_config`) -- si no se pasan, cae al preset de Gemini."""
     cv = cv_text or load_base_cv()
     ciudad_candidato = ciudad or "Bogotá"
     prompt = f"""Eres un reclutador técnico experto. Compara el siguiente CV con la oferta de
@@ -183,7 +214,11 @@ Ubicación: {job.get('ubicacion', '')}
 Descripción: {job['descripcion']}
 """
     try:
-        text = _call_gemini(prompt, api_key)
+        # Ya viene resuelto (main.py llama a resolve_llm_config una sola vez por corrida) -- si no
+        # se pasa nada, cae al preset de Gemini (compatibilidad con el modo demo/single-user).
+        resolved_base_url = base_url or PROVIDER_PRESETS["gemini"]["base_url"]
+        resolved_model = model or PROVIDER_PRESETS["gemini"]["model"]
+        text = _call_llm(prompt, api_key, resolved_base_url, resolved_model)
         result = _extract_json(text)
         score = int(result.get("score", 0))
         justificacion = str(result.get("justificacion", "")).strip()
@@ -200,5 +235,5 @@ if __name__ == "__main__":
         "ubicacion": "Remote",
         "descripcion": "Buscamos backend developer con experiencia en Python, AWS Lambda y DynamoDB.",
     }
-    key = os.environ["GEMINI_API_KEY"]
+    key = os.environ.get("LLM_API_KEY") or os.environ["GEMINI_API_KEY"]
     print(score_job(demo_job, key))

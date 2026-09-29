@@ -88,5 +88,14 @@ jobs:
           # No es secreto -- es la URL pública del dashboard, no un dato sensible.
           DASHBOARD_API_BASE: https://job-hunter-ai-theta.vercel.app
           DASHBOARD_API_TOKEN: ${{ secrets.DASHBOARD_API_TOKEN }}
+          # LLM_API_KEY es el nombre nuevo (cualquier proveedor de IA, no solo Gemini) -- se deja
+          # GEMINI_API_KEY como respaldo por si un repo todavía no se sincronizó con el secret
+          # nuevo (main.py cae a él automáticamente). LLM_BASE_URL/LLM_MODEL solo existen como
+          # secret cuando el usuario eligió un proveedor "Personalizado" en Ajustes; si no están
+          # seteados, main.py usa el preset del proveedor elegido.
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          LLM_PROVIDER: ${{ secrets.LLM_PROVIDER }}
+          LLM_BASE_URL: ${{ secrets.LLM_BASE_URL }}
+          LLM_MODEL: ${{ secrets.LLM_MODEL }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: python main.py

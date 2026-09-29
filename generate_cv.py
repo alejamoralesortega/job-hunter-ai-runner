@@ -1,4 +1,5 @@
-"""Genera un CV adaptado (Markdown -> HTML -> PDF) para una oferta puntual, usando Gemini."""
+"""Genera un CV adaptado (Markdown -> HTML -> PDF) para una oferta puntual, usando el mismo
+proveedor de IA configurado para el scoring (ver score_match.py)."""
 
 import os
 import re
@@ -7,7 +8,7 @@ import markdown as md
 from jinja2 import Environment, FileSystemLoader
 from xhtml2pdf import pisa
 
-from score_match import _call_gemini, load_base_cv
+from score_match import PROVIDER_PRESETS, _call_llm, load_base_cv
 
 TEMPLATES_DIR = os.path.join(os.path.dirname(__file__), "templates")
 OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "generated_cvs")
@@ -20,7 +21,7 @@ def _strip_code_fence(text):
     return text.strip()
 
 
-def tailor_cv_markdown(job, api_key, cv_text=None):
+def tailor_cv_markdown(job, api_key, cv_text=None, base_url=None, model=None):
     cv = cv_text or load_base_cv()
     prompt = f"""Eres un experto en redacción de CVs técnicos. Tienes el CV base de un candidato
 y una oferta de empleo puntual. Debes adaptar el CV para esa oferta:
@@ -42,7 +43,9 @@ Empresa: {job['empresa']}
 Ubicación: {job.get('ubicacion', '')}
 Descripción: {job['descripcion']}
 """
-    text = _call_gemini(prompt, api_key)
+    resolved_base_url = base_url or PROVIDER_PRESETS["gemini"]["base_url"]
+    resolved_model = model or PROVIDER_PRESETS["gemini"]["model"]
+    text = _call_llm(prompt, api_key, resolved_base_url, resolved_model)
     return _strip_code_fence(text)
 
 
@@ -60,9 +63,9 @@ def markdown_to_pdf(markdown_text, output_path):
     return output_path
 
 
-def generate_tailored_cv(job, api_key, cv_text=None):
+def generate_tailored_cv(job, api_key, cv_text=None, base_url=None, model=None):
     """Genera el CV adaptado para `job` y devuelve la ruta del PDF generado."""
-    markdown_text = tailor_cv_markdown(job, api_key, cv_text)
+    markdown_text = tailor_cv_markdown(job, api_key, cv_text, base_url=base_url, model=model)
     safe_id = re.sub(r"[^a-zA-Z0-9_-]", "_", job["id_externo"])
     output_path = os.path.join(OUTPUT_DIR, f"{safe_id}.pdf")
     return markdown_to_pdf(markdown_text, output_path)
@@ -76,6 +79,6 @@ if __name__ == "__main__":
         "ubicacion": "Remote",
         "descripcion": "Buscamos backend developer con experiencia en Python, AWS Lambda y DynamoDB.",
     }
-    key = os.environ["GEMINI_API_KEY"]
+    key = os.environ.get("LLM_API_KEY") or os.environ["GEMINI_API_KEY"]
     path = generate_tailored_cv(demo_job, key)
     print(f"CV generado en: {path}")
